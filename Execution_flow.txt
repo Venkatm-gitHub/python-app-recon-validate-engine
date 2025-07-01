@@ -1,0 +1,441 @@
+1. Initialize system:
+   - Setup logging (logger.py)
+   - Load configurations:
+        data_config.json
+        dictionary_config.json (rule_configuration.py)
+
+2. Fetch active rules:
+   - Query TB_RULES_ENGINE_MST (RuleService.get_active_rules_with_feeds)
+   - Filter by:
+        model, stage, package
+        rule_status = Active/Passive
+        feed_id (if provided) (database_service.py)
+
+3. For each rule:
+   a. Create RuleSpec:
+        - Rule metadata
+        - Data/dictionary configs
+        - As-of date (rule_configuration.py)
+   
+   b. Prepare data sources:
+        - Read tables from config (data_config.json)
+        - Apply schema casting (dataframe_manager.py)
+        - Create Spark DataFrames
+        - Register temp views (SQL rules only)
+
+   c. Execute rule:
+        SQL Rules:
+          - Read SQL file (program_code)
+          - Replace ${as_of_date} parameter
+          - Execute via spark.sql()
+        
+        Python Rules:
+          - Execute Python script (program_code)
+          - Inject: spark, dataframes, as_of_date, rule_id
+          - Expect result_df variable (rule_executor.py)
+
+   d. Export results:
+        - Write result_df to HDFS (parquet)
+        - Sqoop export to Oracle:
+            TB_RULES_EXECUTION_RESULT_DATA (result_exporter.py)
+
+   e. Record execution status:
+        - Insert record to TB_RULES_EXECUTION_STATUS
+        - Includes: rule_run_id, execution status, timestamps (ExecutionStatusService)
+
+4. Post-execution monitoring:
+   - Poll TB_RULES_EXECUTION_STATUS
+   - Check EXCEPTION_APPLIED='Yes' for all rules
+   - Timeout after 60 minutes (polling_engine.py)
+
+
+
+
+
+
+
+
+#########################################################################################################################################################################################################
+
+
+# Rules Engine Code Analysis
+
+## What the System Does
+
+This is a **distributed rules engine** built on Apache Spark that:
+
+1. **Manages Business Rules**: Loads and executes configurable business rules stored in a database
+2. **Processes Data**: Reads data from various sources (Parquet, Delta, CSV) and applies rules
+3. **Supports Multiple Rule Types**: Handles both SQL-based and Python-based rule execution
+4. **Parallel Processing**: Executes multiple rules concurrently using Spark cluster
+5. **Feed-Based Filtering**: Can filter rules based on data feed mappings
+6. **Exception Handling**: Implements polling mechanism for exception handling workflows
+7. **Result Management**: Exports results to HDFS and Oracle database via Sqoop
+8. **Status Tracking**: Maintains execution status and audit trail in database
+
+## Architecture Components
+
+### Core Components
+- **Orchestrator**: Main coordinator that manages the entire workflow
+- **Rule Service**: Database operations for rule management
+- **Rule Processor**: Handles parallel rule execution via Spark jobs
+- **Validation Engine**: Validates rule execution results and handles exceptions
+- **Spark Job Manager**: Submits and manages Spark cluster jobs
+- **DataFrame Manager**: Creates and manages Spark DataFrames from various data sources
+
+### Supporting Components
+- **Database Services**: Oracle database connectivity for rules and status
+- **Configuration Management**: JSON-based configuration for data sources and schemas
+- **Result Exporter**: HDFS storage and Sqoop-based Oracle export
+- **Polling Engine**: Monitors exception status with timeout mechanism
+
+## Order of Execution / Control Flow
+
+### 1. Main Entry Point (`main.py`)
+```
+START → Parse Arguments → Setup Logging → Create Orchestrator → Execute → Exit
+```
+
+### 2. Orchestrator Workflow (`orchestrator.py`)
+```
+Initialize Services → Load Rules → Create Rule Specs → Process Rules → Validate Results
+```
+
+### 3. Rule Loading Process
+```
+For each package:
+  → Query database for active rules
+  → Apply feed filtering (if feed_id provided)
+  → Return combined rule set
+```
+
+### 4. Rule Processing (`rule_processor.py`)
+```
+For each rule (in parallel):
+  → Generate unique run ID
+  → Log execution start status
+  → Submit Spark job
+  → Handle success/failure
+```
+
+### 5. Spark Job Execution (`spark_driver.py`)
+```
+Parse arguments → Create Spark session → Load data → Execute rule → Export results → Update status
+```
+
+### 6. Validation Process (`validation_engine.py`)
+```
+Check execution status → Categorize rules → Poll for exceptions → Validate final status
+```
+
+## Full Pseudo Code
+
+```pseudocode
+MAIN EXECUTION FLOW:
+
+FUNCTION main():
+    logger = setup_logging()
+    args = parse_command_line_arguments()
+    
+    TRY:
+        orchestrator = CREATE Orchestrator(
+            model=args.model,
+            stage=args.stage, 
+            as_of_date=args.as_of_date,
+            packages=args.packages,
+            feed_id=args.feed_id
+        )
+        
+        success = orchestrator.execute()
+        exit_code = success ? 0 : 100
+        RETURN exit_code
+        
+    CATCH Exception:
+        LOG critical_failure
+        RETURN 1
+
+FUNCTION Orchestrator.execute():
+    LOG "Starting orchestration"
+    
+    TRY:
+        // Step 1: Load Rules
+        rules = load_rules()
+        IF rules.empty():
+            LOG "No rules to process"
+            RETURN True
+        
+        // Step 2: Create Rule Specifications
+        rule_specs = []
+        FOR each rule in rules:
+            spec = rule_config.create_rule_spec(rule, as_of_date)
+            rule_specs.append(spec)
+        
+        // Step 3: Process Rules in Parallel
+        success = rule_processor.process_rules_parallel(rule_specs)
+        IF NOT success:
+            RETURN False
+        
+        // Step 4: Validate Results
+        rule_ids = [rule.rule_id for rule in rules]
+        RETURN validation_engine.validate_rules(rule_ids)
+        
+    CATCH Exception:
+        LOG "Orchestration failed"
+        RETURN False
+
+FUNCTION load_rules():
+    all_rules = []
+    FOR each package in packages:
+        rules = rule_service.get_active_rules_with_feeds(
+            model, stage, package, feed_id
+        )
+        all_rules.extend(rules)
+    RETURN all_rules
+
+FUNCTION RuleService.get_active_rules_with_feeds():
+    IF feed_id provided:
+        // Execute complex query with feed mapping logic
+        query = UNION of:
+            - Rules with matching feed mapping
+            - Rules with no feed mapping at all
+    ELSE:
+        // Simple query for all active rules
+        query = "SELECT rules WHERE module=model AND stage=stage AND package=package"
+    
+    results = execute_database_query(query)
+    RETURN map_results_to_rule_objects(results)
+
+FUNCTION RuleProcessor.process_rules_parallel():
+    LOG "Processing rules in parallel"
+    thread_pool = CREATE ThreadPoolExecutor(max_workers=5)
+    
+    futures = {}
+    FOR each rule_spec in rule_specs:
+        future = thread_pool.submit(process_rule, rule_spec)
+        futures[future] = rule_spec.rule.rule_id
+    
+    success_count = 0
+    FOR each completed_future in futures:
+        TRY:
+            IF future.result():
+                success_count++
+        CATCH Exception:
+            LOG error
+    
+    success = (success_count == total_rules)
+    RETURN success
+
+FUNCTION RuleProcessor.process_rule():
+    run_id = generate_unique_run_id()
+    rule = rule_spec.rule
+    
+    // Log start status to database
+    log_rule_start(rule, run_id)
+    
+    TRY:
+        // Submit Spark job to cluster
+        spark_job_manager.submit_spark_job(rule_spec, run_id)
+        RETURN True
+    CATCH Exception:
+        log_rule_failure(rule, run_id, error)
+        RETURN False
+
+FUNCTION SparkJobManager.submit_spark_job():
+    command = [
+        "spark-submit",
+        "--master", "yarn",
+        "--deploy-mode", "cluster", 
+        "--name", "Rule_{rule_id}_{run_id}",
+        "spark_driver.py",
+        "--run_id", run_id,
+        "--rule_spec", json_serialize(rule_spec)
+    ]
+    
+    execute_system_command(command)
+
+// SPARK DRIVER EXECUTION (runs on Spark cluster)
+FUNCTION spark_driver_main():
+    args = parse_arguments()
+    spark_session = create_spark_session()
+    
+    TRY:
+        // Parse rule specification
+        rule_spec_data = json_parse(args.rule_spec)
+        rule = rule_spec_data.rule
+        
+        // Step 1: Create DataFrames from data sources
+        dataframes = create_dataframes(spark_session, rule_spec_data)
+        
+        // Step 2: Execute the rule
+        result_df = execute_rule(spark_session, rule, rule_spec_data, dataframes)
+        
+        // Step 3: Prepare results with metadata
+        result_df = prepare_result_df(result_df, run_id, rule_id)
+        
+        // Step 4: Export results to HDFS and Oracle
+        write_results(result_df, run_id, rule_id)
+        
+        // Step 5: Update execution status
+        update_execution_status(rule, run_id, "Success")
+        
+    CATCH Exception:
+        LOG error
+        update_execution_status(rule, run_id, "Failure")
+        EXIT with error
+
+FUNCTION DataFrameManager.create_dataframes():
+    dataframes = {}
+    FOR each table in data_config.tables:
+        logical_name = table.logicalName
+        path = table.path
+        format = table.kind.RAW
+        
+        // Read data based on format
+        IF format == "PARQUET":
+            df = spark.read.parquet(path)
+        ELIF format == "DELTA":
+            df = spark.read.format("delta").load(path)
+        ELIF format == "CSV":
+            df = spark.read.option("header", "true").csv(path)
+        
+        // Apply schema casting
+        df = apply_schema_casting(df, table.schema)
+        dataframes[logical_name] = df
+    
+    RETURN dataframes
+
+FUNCTION RuleExecutor.execute_rule():
+    rule = rule_spec.rule
+    
+    IF rule.program_type == "SQL":
+        // Create temporary views for all dataframes
+        FOR each dataframe in dataframes:
+            dataframe.createOrReplaceTempView(logical_name)
+        
+        // Read and execute SQL file
+        sql_query = read_file(rule.program_code)
+        sql_query = replace_variables(sql_query, as_of_date)
+        result = spark.sql(sql_query)
+        
+    ELIF rule.program_type == "PYTHON":
+        // Execute Python DSL code
+        execution_context = {
+            'spark': spark_session,
+            'dataframes': dataframes,
+            'as_of_date': as_of_date,
+            'rule_id': rule.rule_id
+        }
+        
+        python_code = read_file(rule.program_code)
+        execute_python_code(python_code, execution_context)
+        result = execution_context['result_df']
+    
+    RETURN result
+
+FUNCTION ValidationEngine.validate_rules():
+    LOG "Starting rules validation"
+    
+    // Get latest execution status for all rules
+    status_records = status_service.get_execution_status(rule_ids)
+    
+    IF no_status_records:
+        RETURN True  // No previous executions to validate
+    
+    // Categorize rules based on their status
+    rule_status_map = {}
+    rules_to_poll = []
+    
+    FOR each status_record in status_records:
+        rule_id, exec_status, exception_applied, rule_status = status_record
+        
+        IF exec_status == "Success":
+            rule_status_map[rule_id] = True
+        ELIF rule_status == "Passive":
+            rule_status_map[rule_id] = True  // Passive rules always pass
+        ELIF rule_status == "Active" AND exec_status != "Success":
+            IF rule_has_feed_mapping(rule_id):
+                rules_to_poll.append(rule_id)  // Need to wait for exceptions
+            ELSE:
+                rule_status_map[rule_id] = True  // No feed mapping, assume OK
+    
+    // Poll for exception handling if needed
+    IF rules_to_poll NOT empty:
+        poll_results = polling_engine.poll_for_exceptions(rules_to_poll)
+        rule_status_map.update(poll_results)
+    
+    // Final validation
+    all_rules_valid = ALL rules in rule_status_map are True
+    RETURN all_rules_valid
+
+FUNCTION PollingEngine.poll_for_exceptions():
+    LOG "Starting exception polling"
+    results = initialize_all_rules_as_false(rule_ids)
+    
+    FOR attempt in range(60):  // Poll for 1 hour (60 minutes)
+        status_records = get_execution_status(rule_ids)
+        remaining_rules = []
+        
+        FOR each status_record in status_records:
+            rule_id, _, exception_applied, _ = status_record
+            
+            IF exception_applied == "Yes":
+                results[rule_id] = True  // Exception handled
+            ELSE:
+                remaining_rules.append(rule_id)  // Still waiting
+        
+        IF no_remaining_rules:
+            BREAK  // All exceptions handled
+        
+        rule_ids = remaining_rules
+        SLEEP 60 seconds
+    
+    RETURN results
+
+FUNCTION ResultExporter.export_results():
+    // Step 1: Write to HDFS
+    output_path = "{hdfs_output_path}/{rule_id}/{run_id}"
+    result_df.write.mode("overwrite").parquet(output_path)
+    
+    // Step 2: Export to Oracle via Sqoop
+    sqoop_command = [
+        "sqoop", "export",
+        "--connect", ORACLE_JDBC_URL,
+        "--username", ORACLE_USERNAME, 
+        "--password", ORACLE_PASSWORD,
+        "--table", "TB_RULES_EXECUTION_RESULT_DATA",
+        "--export-dir", output_path,
+        "--input-fields-terminated-by", "\t"
+    ]
+    
+    execute_system_command(sqoop_command)
+```
+
+## Full Execution Flow in Statements
+
+1. **System Initialization**: Parse command line arguments, setup logging, create orchestrator with database connections
+
+2. **Rule Discovery**: Query Oracle database to find all active rules matching the specified model, stage, and packages, with optional feed filtering
+
+3. **Rule Specification Creation**: For each rule, create a specification object containing rule metadata, data configuration, and dictionary configuration
+
+4. **Parallel Rule Processing**: Submit each rule as a separate Spark job to the cluster using ThreadPoolExecutor with 5 concurrent workers
+
+5. **Spark Job Execution**: Each Spark job runs independently on the cluster, loading data, executing rule logic, and exporting results
+
+6. **Data Loading**: Create Spark DataFrames from various sources (Parquet, Delta, CSV) with schema casting based on dictionary configuration
+
+7. **Rule Execution**: Execute either SQL queries or Python DSL code against the loaded DataFrames to produce results
+
+8. **Result Export**: Write results to HDFS in Parquet format, then export to Oracle database using Sqoop
+
+9. **Status Tracking**: Update execution status in Oracle database for audit trail and monitoring
+
+10. **Validation Process**: Check execution status of all rules, categorize them based on success/failure and rule type (Active/Passive)
+
+11. **Exception Polling**: For failed Active rules with feed mappings, poll for up to 1 hour waiting for exception handling workflows to complete
+
+12. **Final Validation**: Determine overall success based on individual rule outcomes and exception handling results
+
+13. **Process Completion**: Return exit code (0 for success, 100 for failure) and terminate the orchestration process
+
+The system is designed for enterprise-scale data processing with robust error handling, parallel execution, and comprehensive audit capabilities.
